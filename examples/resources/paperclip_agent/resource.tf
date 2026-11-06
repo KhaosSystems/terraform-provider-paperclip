@@ -56,3 +56,15 @@ variable "agent_webhook_token" {
   type      = string
   sensitive = true
 }
+
+# An agent with its own instructions, a skill and no authority to hire.
+resource "paperclip_agent" "writer" {
+  company_id   = paperclip_company.studio.id
+  name         = "Screenwriter"
+  reports_to   = paperclip_agent.producer.id
+  adapter_type = "codex_local"
+
+  instructions      = file("${path.module}/agents/writer/AGENTS.md")
+  skills            = [paperclip_skill.greenlight.key]
+  can_create_agents = false
+}

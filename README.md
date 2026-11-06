@@ -43,6 +43,23 @@ resource "paperclip_agent" "producer" {
   runtime_config = jsonencode({
     heartbeat = { enabled = true, intervalSec = 300 }
   })
+  can_create_agents = false
+}
+
+resource "paperclip_skill" "greenlight" {
+  company_id = paperclip_company.studio.id
+  name       = "Greenlight API"
+  markdown   = file("${path.module}/skills/greenlight/SKILL.md")
+}
+
+resource "paperclip_agent" "director" {
+  company_id        = paperclip_company.studio.id
+  name              = "Director"
+  reports_to        = paperclip_agent.producer.id
+  adapter_type      = "codex_local"
+  instructions      = file("${path.module}/agents/director/AGENTS.md")
+  skills            = [paperclip_skill.greenlight.key]
+  can_create_agents = false
 }
 ```
 
@@ -54,6 +71,7 @@ Full reference documentation is in [`docs/`](docs/index.md), with runnable snipp
 | Resource    | `paperclip_agent`   | An agent, with its adapter and runtime settings |
 | Resource    | `paperclip_goal`    | A goal in the company's goal tree               |
 | Resource    | `paperclip_project` | A project linked to goals and a lead agent      |
+| Resource    | `paperclip_skill`   | A skill in the company's library                |
 | Data source | `paperclip_company` | Look a company up by id or name                 |
 | Data source | `paperclip_agent`   | Look an agent up by id, or by name in a company |
 | Data source | `paperclip_agents`  | List the agents of a company                    |
@@ -74,7 +92,11 @@ Creating companies needs instance-admin rights.
 - **Secrets are not read back.** Paperclip redacts plain values under `adapter_config.env`. The provider assumes they are unchanged and never writes the redaction placeholder back. Plain values are still stored in the Terraform state, so prefer secret references.
 - **Destroying a company deletes everything in it,** including tasks and history that Terraform never managed.
 - **Runtime data is out of scope.** Tasks, approvals and runs change constantly while agents work and do not belong in Terraform state.
-- **Agent instructions are not managed yet.** Editing an agent's instruction files needs a revision handshake that this version does not implement.
+- **Instructions need a supporting adapter.** `instructions` manages the entry file only, and `process` and `http` agents have no instruction bundle. Agents can edit their own instructions; the next apply puts the declared content back.
+- **`skills` is authoritative when set.** It replaces whatever else is assigned. Leave it out to manage assignments elsewhere.
+- **Agents can hire by default.** Set `can_create_agents = false` to keep the organisation as declared.
+- **Task assignment is not an attribute.** The API reports every active agent as able to assign tasks, so the provider could not confirm a declared value. It keeps the existing grant unchanged.
+- **Destroying a skill detaches it first,** from every agent using it, including agents Terraform does not manage. A warning names them.
 
 ## Development
 

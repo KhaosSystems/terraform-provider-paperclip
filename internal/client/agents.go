@@ -8,37 +8,43 @@ const RedactedValue = "***REDACTED***"
 
 // Agent is a Paperclip agent: an AI employee of a company.
 type Agent struct {
-	ID                 string         `json:"id"`
-	CompanyID          string         `json:"companyId"`
-	Name               string         `json:"name"`
-	URLKey             string         `json:"urlKey"`
-	Role               string         `json:"role"`
-	Title              *string        `json:"title"`
-	Status             string         `json:"status"`
-	ReportsTo          *string        `json:"reportsTo"`
-	Capabilities       *string        `json:"capabilities"`
-	AdapterType        string         `json:"adapterType"`
-	AdapterConfig      map[string]any `json:"adapterConfig"`
-	RuntimeConfig      map[string]any `json:"runtimeConfig"`
-	BudgetMonthlyCents int64          `json:"budgetMonthlyCents"`
-	SpentMonthlyCents  int64          `json:"spentMonthlyCents"`
-	Metadata           map[string]any `json:"metadata"`
-	CreatedAt          string         `json:"createdAt"`
-	UpdatedAt          string         `json:"updatedAt"`
+	ID                 string            `json:"id"`
+	CompanyID          string            `json:"companyId"`
+	Name               string            `json:"name"`
+	URLKey             string            `json:"urlKey"`
+	Role               string            `json:"role"`
+	Title              *string           `json:"title"`
+	Status             string            `json:"status"`
+	ReportsTo          *string           `json:"reportsTo"`
+	Capabilities       *string           `json:"capabilities"`
+	AdapterType        string            `json:"adapterType"`
+	AdapterConfig      map[string]any    `json:"adapterConfig"`
+	RuntimeConfig      map[string]any    `json:"runtimeConfig"`
+	BudgetMonthlyCents int64             `json:"budgetMonthlyCents"`
+	SpentMonthlyCents  int64             `json:"spentMonthlyCents"`
+	Metadata           map[string]any    `json:"metadata"`
+	Permissions        *AgentPermissions `json:"permissions"`
+	Access             *AgentAccess      `json:"access"`
+	CreatedAt          string            `json:"createdAt"`
+	UpdatedAt          string            `json:"updatedAt"`
 }
 
 // AgentCreate is the request body for creating an agent.
 type AgentCreate struct {
-	Name               string         `json:"name"`
-	Role               *string        `json:"role,omitempty"`
-	Title              *string        `json:"title"`
-	ReportsTo          *string        `json:"reportsTo"`
-	Capabilities       *string        `json:"capabilities"`
-	AdapterType        string         `json:"adapterType"`
-	AdapterConfig      map[string]any `json:"adapterConfig,omitzero"`
-	RuntimeConfig      map[string]any `json:"runtimeConfig,omitzero"`
-	BudgetMonthlyCents *int64         `json:"budgetMonthlyCents,omitempty"`
-	Metadata           map[string]any `json:"metadata"`
+	Name               string                  `json:"name"`
+	Role               *string                 `json:"role,omitempty"`
+	Title              *string                 `json:"title"`
+	ReportsTo          *string                 `json:"reportsTo"`
+	Capabilities       *string                 `json:"capabilities"`
+	AdapterType        string                  `json:"adapterType"`
+	AdapterConfig      map[string]any          `json:"adapterConfig,omitzero"`
+	RuntimeConfig      map[string]any          `json:"runtimeConfig,omitzero"`
+	BudgetMonthlyCents *int64                  `json:"budgetMonthlyCents,omitempty"`
+	Metadata           map[string]any          `json:"metadata"`
+	Permissions        *AgentPermissionsCreate `json:"permissions,omitempty"`
+	// DesiredSkills is sent when non-nil, so an empty list assigns no skills.
+	DesiredSkills      []string                       `json:"desiredSkills,omitzero"`
+	InstructionsBundle *AgentInstructionsBundleCreate `json:"instructionsBundle,omitempty"`
 }
 
 // AgentUpdate is the request body for updating an agent. Nullable fields are

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 
@@ -17,7 +18,8 @@ import (
 // the provider uses. It mirrors the behaviour of the real server that matters
 // to the provider: server-side defaults, merge-or-replace semantics for the
 // adapter config, redaction of plain environment values and the approval gate
-// on direct agent creation.
+// on direct agent creation, the revision check on instruction writes, and the
+// refusal to delete a skill that is still in use.
 //
 // The acceptance tests run against it unless PAPERCLIP_API_URL points at a
 // real instance.
@@ -32,7 +34,7 @@ type record = map[string]any
 
 func newFakePaperclip() *httptest.Server {
 	f := &fakePaperclip{records: map[string]map[string]record{
-		"companies": {}, "agents": {}, "goals": {}, "projects": {},
+		"companies": {}, "agents": {}, "goals": {}, "projects": {}, "skills": {}, "instructions": {},
 	}}
 
 	mux := http.NewServeMux()
@@ -56,10 +58,26 @@ func newFakePaperclip() *httptest.Server {
 	mux.HandleFunc("GET /api/agents/{id}", f.handle(func(r *http.Request, body record) (int, any) {
 		status, out := f.get("agents")(r, body)
 		if rec, ok := out.(record); ok {
-			return status, redactAgent(rec)
+			rec = redactAgent(rec)
+			// Only the single-agent read includes the access state.
+			rec["access"] = record{"grants": rec["grants"]}
+			delete(rec, "grants")
+			return status, rec
 		}
 		return status, out
 	}))
+	mux.HandleFunc("PATCH /api/agents/{id}/permissions", f.handle(f.patchPermissions))
+	mux.HandleFunc("POST /api/agents/{id}/skills/sync", f.handle(f.syncSkills))
+	mux.HandleFunc("GET /api/agents/{id}/instructions-bundle", f.handle(f.getBundle))
+	mux.HandleFunc("GET /api/agents/{id}/instructions-bundle/file", f.handle(f.getInstructions))
+	mux.HandleFunc("PUT /api/agents/{id}/instructions-bundle/file", f.handle(f.putInstructions))
+
+	mux.HandleFunc("POST /api/companies/{id}/skills", f.handle(f.createSkill))
+	mux.HandleFunc("GET /api/companies/{id}/skills/{skillId}", f.handle(f.getSkill))
+	mux.HandleFunc("PATCH /api/companies/{id}/skills/{skillId}", f.handle(f.patchSkill))
+	mux.HandleFunc("POST /api/companies/{id}/skills/{skillId}/rename", f.handle(f.renameSkill))
+	mux.HandleFunc("PATCH /api/companies/{id}/skills/{skillId}/files", f.handle(f.patchSkillFile))
+	mux.HandleFunc("DELETE /api/companies/{id}/skills/{skillId}", f.handle(f.deleteSkill))
 	mux.HandleFunc("PATCH /api/agents/{id}", f.handle(f.patchAgent))
 	mux.HandleFunc("DELETE /api/agents/{id}", f.handle(f.delete("agents")))
 
@@ -193,7 +211,7 @@ func (f *fakePaperclip) deleteCompany(r *http.Request, body record) (int, any) {
 	if status != http.StatusOK {
 		return status, out
 	}
-	for _, collection := range []string{"agents", "goals", "projects"} {
+	for _, collection := range []string{"agents", "goals", "projects", "skills"} {
 		for childID, rec := range f.records[collection] {
 			if rec["companyId"] == id {
 				delete(f.records[collection], childID)
@@ -238,9 +256,292 @@ func (f *fakePaperclip) createAgent(r *http.Request, body record) (int, any) {
 		"budgetMonthlyCents": orDefault(body["budgetMonthlyCents"], float64(0)),
 		"spentMonthlyCents":  float64(0),
 		"metadata":           body["metadata"],
+		"permissions":        record{"canCreateAgents": true, "canCreateSkills": true},
+		"grants":             []any{record{"permissionKey": "tasks:assign"}},
 	}
+	if requested, ok := body["permissions"].(record); ok {
+		maps.Copy(rec["permissions"].(record), requested)
+	}
+
+	if desired, present := body["desiredSkills"].([]any); present {
+		if err := f.assignSkills(rec, desired); err != nil {
+			return fakeError(http.StatusUnprocessableEntity, err.Error())
+		}
+	}
+
+	// Only some adapters have instruction bundles; the others ignore them.
+	if fakeBundleAdapters[adapterType] {
+		cfg := maps.Clone(rec["adapterConfig"].(record))
+		cfg["instructionsBundleMode"] = "managed"
+		cfg["instructionsEntryFile"] = "AGENTS.md"
+		rec["adapterConfig"] = cfg
+
+		content := "You are a default agent."
+		if bundle, ok := body["instructionsBundle"].(record); ok {
+			files, _ := bundle["files"].(record)
+			if entry, ok := files["AGENTS.md"].(string); ok {
+				content = entry
+			}
+		}
+		f.records["instructions"][id] = record{"content": content, "revision": record{"id": f.nextID()}}
+	}
+
 	f.records["agents"][id] = rec
 	return http.StatusCreated, redactAgent(maps.Clone(rec))
+}
+
+// fakeBundleAdapters lists the adapters with managed instruction bundles.
+var fakeBundleAdapters = map[string]bool{"codex_local": true, "opencode_local": true}
+
+func (f *fakePaperclip) patchPermissions(r *http.Request, body record) (int, any) {
+	rec, ok := f.records["agents"][r.PathValue("id")]
+	if !ok {
+		return fakeError(http.StatusNotFound, "Agent not found")
+	}
+	createAgents, ok1 := body["canCreateAgents"].(bool)
+	assignTasks, ok2 := body["canAssignTasks"].(bool)
+	if !ok1 || !ok2 {
+		return fakeError(http.StatusBadRequest, "Validation error")
+	}
+	permissions := maps.Clone(rec["permissions"].(record))
+	permissions["canCreateAgents"] = createAgents
+	if skills, present := body["canCreateSkills"]; present {
+		permissions["canCreateSkills"] = skills
+	}
+	rec["permissions"] = permissions
+	rec["grants"] = []any{}
+	if assignTasks {
+		rec["grants"] = []any{record{"permissionKey": "tasks:assign"}}
+	}
+	return http.StatusOK, redactAgent(maps.Clone(rec))
+}
+
+// assignSkills resolves references the way the server does, by key or by slug,
+// and stores the full keys in the adapter config.
+func (f *fakePaperclip) assignSkills(agent record, references []any) error {
+	entries := make([]any, 0, len(references))
+	for _, reference := range references {
+		name, _ := reference.(string)
+		var key any
+		for _, skill := range f.records["skills"] {
+			if skill["companyId"] == agent["companyId"] && (skill["key"] == name || skill["slug"] == name) {
+				key = skill["key"]
+			}
+		}
+		if key == nil {
+			return fmt.Errorf("invalid company skill selection: unknown reference %s", name)
+		}
+		entries = append(entries, record{"key": key, "versionId": nil})
+	}
+	cfg := maps.Clone(agent["adapterConfig"].(record))
+	cfg["paperclipSkillSync"] = record{"desiredSkills": entries}
+	agent["adapterConfig"] = cfg
+	return nil
+}
+
+// agentSkillKeys returns the skill keys stored on an agent.
+func agentSkillKeys(agent record) []string {
+	cfg, _ := agent["adapterConfig"].(record)
+	sync, _ := cfg["paperclipSkillSync"].(record)
+	entries, _ := sync["desiredSkills"].([]any)
+	keys := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if e, ok := entry.(record); ok {
+			keys = append(keys, e["key"].(string))
+		}
+	}
+	return keys
+}
+
+func (f *fakePaperclip) syncSkills(r *http.Request, body record) (int, any) {
+	rec, ok := f.records["agents"][r.PathValue("id")]
+	if !ok {
+		return fakeError(http.StatusNotFound, "Agent not found")
+	}
+	desired, present := body["desiredSkills"].([]any)
+	if !present {
+		return fakeError(http.StatusUnprocessableEntity, "Skill sync requires desiredSkills.")
+	}
+	switch body["mode"] {
+	case "replace":
+	case "remove":
+		remaining := []any{}
+		for _, key := range agentSkillKeys(rec) {
+			if !slices.Contains(desired, any(key)) {
+				remaining = append(remaining, key)
+			}
+		}
+		desired = remaining
+	default:
+		return fakeError(http.StatusUnprocessableEntity, "Skill sync requires a mode.")
+	}
+	if err := f.assignSkills(rec, desired); err != nil {
+		return fakeError(http.StatusUnprocessableEntity, err.Error())
+	}
+	return http.StatusOK, record{"desiredSkills": desired}
+}
+
+func (f *fakePaperclip) getBundle(r *http.Request, _ record) (int, any) {
+	if _, ok := f.records["agents"][r.PathValue("id")]; !ok {
+		return fakeError(http.StatusNotFound, "Agent not found")
+	}
+	return http.StatusOK, record{"entryFile": "AGENTS.md"}
+}
+
+func (f *fakePaperclip) getInstructions(r *http.Request, _ record) (int, any) {
+	if r.URL.Query().Get("path") != "AGENTS.md" {
+		return fakeError(http.StatusUnprocessableEntity, "Query parameter 'path' is required")
+	}
+	file, ok := f.records["instructions"][r.PathValue("id")]
+	if !ok {
+		return fakeError(http.StatusNotFound, "File not found")
+	}
+	return http.StatusOK, maps.Clone(file)
+}
+
+func (f *fakePaperclip) putInstructions(r *http.Request, body record) (int, any) {
+	id := r.PathValue("id")
+	agent, ok := f.records["agents"][id]
+	if !ok {
+		return fakeError(http.StatusNotFound, "Agent not found")
+	}
+	if !fakeBundleAdapters[agent["adapterType"].(string)] {
+		return fakeError(http.StatusUnprocessableEntity, "This adapter does not support instruction bundles.")
+	}
+	base, present := body["baseRevisionId"]
+	if !present {
+		return fakeError(http.StatusUnprocessableEntity, "Read the entry and supply baseRevisionId (null for a new entry)")
+	}
+	var current any
+	if file, ok := f.records["instructions"][id]; ok {
+		current = file["revision"].(record)["id"]
+	}
+	if base != current {
+		return fakeError(http.StatusConflict, "Instructions changed since the base revision. Read the current entry before saving.")
+	}
+	file := record{"content": body["content"], "revision": record{"id": f.nextID()}}
+	f.records["instructions"][id] = file
+	return http.StatusOK, maps.Clone(file)
+}
+
+func (f *fakePaperclip) skill(r *http.Request) (record, bool) {
+	rec, ok := f.records["skills"][r.PathValue("skillId")]
+	if !ok || rec["companyId"] != r.PathValue("id") {
+		return nil, false
+	}
+	return rec, true
+}
+
+// applyFrontmatter lets the frontmatter win over other values, like the server.
+func applyFrontmatter(rec record, markdown string) {
+	rec["markdown"] = markdown
+	if name, ok := frontmatterValue(markdown, "name"); ok {
+		rec["name"] = name
+	}
+	if description, ok := frontmatterValue(markdown, "description"); ok {
+		rec["description"] = description
+	}
+}
+
+func (f *fakePaperclip) createSkill(r *http.Request, body record) (int, any) {
+	company, ok := f.company(r)
+	if !ok {
+		return fakeError(http.StatusNotFound, "Company not found")
+	}
+	name, _ := body["name"].(string)
+	if name == "" {
+		return fakeError(http.StatusBadRequest, "Validation error")
+	}
+	slug, _ := body["slug"].(string)
+	if slug == "" {
+		slug = slugify(name)
+	}
+	key := fmt.Sprintf("company/%s/%s", company["id"], slug)
+	for _, existing := range f.records["skills"] {
+		if existing["key"] == key {
+			return fakeError(http.StatusConflict, "A skill with this slug already exists.")
+		}
+	}
+	id := f.nextID()
+	rec := record{
+		"id": id, "companyId": company["id"], "key": key, "slug": slug, "name": name,
+		"description": body["description"], "sourceType": "managed", "currentVersionId": f.nextID(),
+	}
+	markdown, _ := body["markdown"].(string)
+	applyFrontmatter(rec, markdown)
+	f.records["skills"][id] = rec
+	return http.StatusCreated, maps.Clone(rec)
+}
+
+func (f *fakePaperclip) getSkill(r *http.Request, _ record) (int, any) {
+	rec, ok := f.skill(r)
+	if !ok {
+		return fakeError(http.StatusNotFound, "Skill not found")
+	}
+	out := maps.Clone(rec)
+	used := []any{}
+	for _, agent := range f.records["agents"] {
+		if slices.Contains(agentSkillKeys(agent), rec["key"].(string)) {
+			used = append(used, record{"id": agent["id"], "name": agent["name"]})
+		}
+	}
+	out["usedByAgents"] = used
+	return http.StatusOK, out
+}
+
+func (f *fakePaperclip) patchSkill(r *http.Request, body record) (int, any) {
+	rec, ok := f.skill(r)
+	if !ok {
+		return fakeError(http.StatusNotFound, "Skill not found")
+	}
+	if description, present := body["description"]; present {
+		rec["description"] = description
+	}
+	return http.StatusOK, maps.Clone(rec)
+}
+
+// renameSkill rewrites a name in the frontmatter, like the server, which is why
+// the provider has to compare the content after a rename.
+func (f *fakePaperclip) renameSkill(r *http.Request, body record) (int, any) {
+	rec, ok := f.skill(r)
+	if !ok {
+		return fakeError(http.StatusNotFound, "Skill not found")
+	}
+	name, _ := body["name"].(string)
+	if old, found := frontmatterValue(rec["markdown"].(string), "name"); found {
+		rec["markdown"] = strings.Replace(rec["markdown"].(string), "name: "+old, "name: "+name, 1)
+	}
+	rec["name"] = name
+	return http.StatusOK, record{"skill": maps.Clone(rec)}
+}
+
+func (f *fakePaperclip) patchSkillFile(r *http.Request, body record) (int, any) {
+	rec, ok := f.skill(r)
+	if !ok {
+		return fakeError(http.StatusNotFound, "Skill not found")
+	}
+	if body["path"] != "SKILL.md" {
+		return fakeError(http.StatusUnprocessableEntity, "Invalid skill file path.")
+	}
+	content, _ := body["content"].(string)
+	applyFrontmatter(rec, content)
+	rec["currentVersionId"] = f.nextID()
+	return http.StatusOK, record{"path": "SKILL.md"}
+}
+
+func (f *fakePaperclip) deleteSkill(r *http.Request, _ record) (int, any) {
+	rec, ok := f.skill(r)
+	if !ok {
+		return fakeError(http.StatusNotFound, "Skill not found")
+	}
+	for _, agent := range f.records["agents"] {
+		if slices.Contains(agentSkillKeys(agent), rec["key"].(string)) {
+			return fakeError(http.StatusUnprocessableEntity, fmt.Sprintf(
+				"Cannot delete skill %q while it is still used by %s. Detach it from those agents first.", rec["name"], agent["name"]))
+		}
+	}
+	delete(f.records["skills"], rec["id"].(string))
+	return http.StatusOK, record{"ok": true}
 }
 
 func (f *fakePaperclip) patchAgent(r *http.Request, body record) (int, any) {
@@ -262,6 +563,11 @@ func (f *fakePaperclip) patchAgent(r *http.Request, body record) (int, any) {
 	}
 	if incoming, present := body["runtimeConfig"]; present {
 		rec["runtimeConfig"] = withRuntimeDefaults(incoming)
+	}
+
+	// Fields the real server rejects here and handles through other routes.
+	if _, present := body["permissions"]; present {
+		return fakeError(http.StatusUnprocessableEntity, "Use /api/agents/:id/permissions for permission changes")
 	}
 
 	status, out := f.patch("agents", "name", "role", "title", "reportsTo", "capabilities",

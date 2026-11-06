@@ -151,6 +151,7 @@ func (p *paperclipProvider) Resources(_ context.Context) []func() resource.Resou
 		NewAgentResource,
 		NewGoalResource,
 		NewProjectResource,
+		NewSkillResource,
 	}
 }
 

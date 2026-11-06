@@ -4,7 +4,9 @@ import (
 	"cmp"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
+	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework-jsontypes/jsontypes"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -176,6 +178,115 @@ func jsonObjectState(remote map[string]any, prior jsontypes.Normalized, attr pat
 		return encodeJSONObject(remote, attr, diags)
 	}
 	return encodeJSONObject(projected, attr, diags)
+}
+
+// serverManagedAdapterKeys are the adapter config keys Paperclip writes itself
+// to record an agent's instruction bundle and assigned skills. The API replaces
+// the whole adapter config on update, so these have to be sent back or the
+// agent loses its instructions and skills.
+var serverManagedAdapterKeys = []string{
+	"instructionsBundleMode",
+	"instructionsRootPath",
+	"instructionsEntryFile",
+	"instructionsFilePath",
+	"agentsMdPath",
+	"paperclipSkillSync",
+}
+
+// withServerManagedKeys returns desired plus any server-managed keys from
+// remote that desired does not set itself.
+func withServerManagedKeys(desired, remote map[string]any) map[string]any {
+	out := maps.Clone(orEmpty(desired))
+	for _, key := range serverManagedAdapterKeys {
+		if _, declared := out[key]; declared {
+			continue
+		}
+		if value, ok := remote[key]; ok {
+			out[key] = value
+		}
+	}
+	return out
+}
+
+// withoutServerManagedKeys returns remote without the server-managed keys.
+func withoutServerManagedKeys(remote map[string]any) map[string]any {
+	out := maps.Clone(orEmpty(remote))
+	for _, key := range serverManagedAdapterKeys {
+		delete(out, key)
+	}
+	return out
+}
+
+// adapterConfigState computes the state value for adapter_config. With nothing
+// declared, for example after an import, it stores the remote value without the
+// keys that other attributes cover.
+func adapterConfigState(remote map[string]any, prior jsontypes.Normalized, attr path.Path, diags *diag.Diagnostics) jsontypes.Normalized {
+	if prior.IsNull() || prior.IsUnknown() {
+		return encodeJSONObject(withoutServerManagedKeys(remote), attr, diags)
+	}
+	return jsonObjectState(remote, prior, attr, diags)
+}
+
+// sameSkill reports whether a declared reference names a skill key. The API
+// accepts a full key or a bare slug and always stores the full key.
+func sameSkill(reference, key string) bool {
+	reference, key = strings.ToLower(reference), strings.ToLower(key)
+	return reference == key || strings.HasSuffix(key, "/"+reference)
+}
+
+// matchSkillReferences maps the remote skill keys back to the spelling used in
+// the configuration, so a slug does not show up as drift against its key. Keys
+// that nothing declares are returned as they are.
+func matchSkillReferences(declared, remote []string) []string {
+	out := make([]string, 0, len(remote))
+	for _, key := range remote {
+		match := key
+		for _, reference := range declared {
+			if sameSkill(reference, key) {
+				match = reference
+				break
+			}
+		}
+		out = append(out, match)
+	}
+	return out
+}
+
+// skillSetsEqual reports whether the remote keys are exactly the declared set.
+func skillSetsEqual(declared, remote []string) bool {
+	a := slices.Clone(declared)
+	b := matchSkillReferences(declared, remote)
+	slices.Sort(a)
+	slices.Sort(b)
+	return slices.Equal(slices.Compact(a), slices.Compact(b))
+}
+
+// frontmatterValue returns a single-line top-level value from a markdown file's
+// YAML frontmatter. It reports false when the key is missing or uses a form it
+// cannot read, such as a block scalar.
+func frontmatterValue(markdown, key string) (string, bool) {
+	lines := strings.Split(strings.ReplaceAll(markdown, "\r\n", "\n"), "\n")
+	if strings.TrimRight(lines[0], " \t") != "---" {
+		return "", false
+	}
+	for _, line := range lines[1:] {
+		if strings.TrimRight(line, " \t") == "---" {
+			return "", false
+		}
+		name, value, found := strings.Cut(line, ":")
+		if !found || name != key {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if value == "" || strings.ContainsAny(value[:1], "|>") {
+			return "", false
+		}
+		if len(value) >= 2 && (value[0] == '"' || value[0] == '\'') && value[len(value)-1] == value[0] {
+			value = value[1 : len(value)-1]
+		}
+		return value, true
+	}
+	return "", false
 }
 
 func orEmpty(v map[string]any) map[string]any {

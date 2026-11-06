@@ -11,4 +11,6 @@ All notable changes to this project are documented here. The format follows [Kee
 - `paperclip_agent` resource, with adapter and runtime settings as JSON objects.
 - `paperclip_goal` resource.
 - `paperclip_project` resource.
+- `paperclip_skill` resource.
+- `instructions`, `skills`, `can_create_agents` and `can_create_skills` on `paperclip_agent`.
 - `paperclip_company`, `paperclip_agent` and `paperclip_agents` data sources.

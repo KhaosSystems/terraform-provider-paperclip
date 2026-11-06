@@ -26,7 +26,7 @@ func main() {
 	flag.Parse()
 
 	opts := providerserver.ServeOpts{
-		Address: "registry.terraform.io/KhaosSystems/paperclip",
+		Address: "registry.terraform.io/khaossystems/paperclip",
 		Debug:   debug,
 	}
 
