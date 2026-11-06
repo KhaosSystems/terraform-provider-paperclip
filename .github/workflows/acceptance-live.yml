@@ -1,0 +1,67 @@
+# Runs the acceptance tests against a real Paperclip instance.
+#
+# The instance runs in the "local_trusted" deployment mode, which needs no
+# credentials but only listens on loopback. Host networking makes it reachable
+# from the runner.
+#
+# This workflow does not gate pull requests: the regular test workflow covers
+# the provider against the in-memory fake, and this one catches drift between
+# that fake and the real API.
+name: Acceptance (live Paperclip)
+
+on:
+  workflow_dispatch:
+    inputs:
+      paperclip_image:
+        description: Paperclip container image to test against
+        required: true
+        default: ghcr.io/paperclipai/paperclip:latest
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance-live:
+    name: Acceptance against a Paperclip container
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PAPERCLIP_IMAGE: ${{ inputs.paperclip_image || 'ghcr.io/paperclipai/paperclip:latest' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_wrapper: false
+
+      - name: Start Paperclip
+        run: |
+          docker run --detach --name paperclip --network host \
+            --env PAPERCLIP_DEPLOYMENT_MODE=local_trusted \
+            "$PAPERCLIP_IMAGE"
+
+      - name: Wait for Paperclip
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --max-time 2 http://127.0.0.1:3100/api/health > /dev/null; then
+              echo "Paperclip is up after ${attempt} attempts."
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "Paperclip did not become healthy in time."
+          exit 1
+
+      - run: go test ./internal/provider/ -run '^TestAcc' -count=1 -timeout 20m -v
+        env:
+          TF_ACC: "1"
+          PAPERCLIP_API_URL: http://127.0.0.1:3100
+
+      - name: Paperclip logs
+        if: always()
+        run: docker logs paperclip 2>&1 | tail -n 200

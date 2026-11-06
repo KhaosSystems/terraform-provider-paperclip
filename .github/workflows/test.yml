@@ -1,0 +1,123 @@
+name: Tests
+
+on:
+  pull_request:
+    paths-ignore:
+      - "README.md"
+      - "CHANGELOG.md"
+  push:
+    branches: [main]
+    paths-ignore:
+      - "README.md"
+      - "CHANGELOG.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go mod download
+      - name: Check go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+      - run: go build -v .
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15.0
+
+  generate:
+    name: Generated docs are up to date
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_wrapper: false
+      - run: go generate ./...
+      - name: Check for a diff
+        run: |
+          git diff --exit-code -- docs || \
+            (echo; echo "Generated docs are out of date. Run 'make generate' and commit the result."; exit 1)
+
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test ./... -race -cover -timeout 5m
+
+  # Acceptance tests drive a real Terraform binary. Without PAPERCLIP_API_URL
+  # they run against the in-memory fake of the Paperclip API that ships with
+  # the tests, so they need no secrets and are safe on pull requests.
+  acceptance:
+    name: Acceptance (Terraform ${{ matrix.terraform }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        terraform:
+          - "1.5.*"
+          - "1.9.*"
+          - "1.13.*"
+          - "1.17.*"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ matrix.terraform }}
+          terraform_wrapper: false
+      - run: go test ./internal/provider/ -run '^TestAcc' -count=1 -timeout 15m -v
+        env:
+          TF_ACC: "1"
+
+  acceptance-opentofu:
+    name: Acceptance (OpenTofu)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_wrapper: false
+      - run: |
+          export TF_ACC_TERRAFORM_PATH="$(command -v tofu)"
+          go test ./internal/provider/ -run '^TestAcc' -count=1 -timeout 15m -v
+        env:
+          TF_ACC: "1"
+          TF_ACC_PROVIDER_NAMESPACE: hashicorp
+          TF_ACC_PROVIDER_HOST: registry.opentofu.org
