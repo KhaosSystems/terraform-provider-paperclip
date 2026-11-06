@@ -1,0 +1,7 @@
+# Keep line endings consistent across platforms, so that generated files do
+# not differ between a Windows checkout and CI.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.zip binary
